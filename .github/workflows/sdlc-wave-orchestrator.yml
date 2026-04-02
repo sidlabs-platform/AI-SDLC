@@ -1,0 +1,407 @@
+# ──────────────────────────────────────────────────────────────
+# SDLC — Wave Orchestrator
+#
+# Handles wave-by-wave build orchestration. Triggers when
+# wave-related PRs are merged and automatically creates the
+# next wave issue or completes the build stage.
+# ──────────────────────────────────────────────────────────────
+name: "SDLC — Wave Orchestrator"
+
+on:
+  pull_request:
+    types: [closed]
+
+  # Manual recovery trigger — use when a wave PR was merged without
+  # the sdlc:wave label and the orchestrator was skipped.
+  workflow_dispatch:
+    inputs:
+      completed_wave:
+        description: "Wave number that was completed (e.g. 0, 1, 2)"
+        required: true
+        type: string
+      pr_number:
+        description: "PR number that delivered the completed wave"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  orchestrate-wave:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.pull_request.merged == true &&
+        (
+          contains(github.event.pull_request.labels.*.name, 'sdlc:build-plan') ||
+          contains(github.event.pull_request.labels.*.name, 'sdlc:wave')
+        )
+      )
+
+    steps:
+      # ── 1. Checkout repository ──────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      # ── 2. Detect trigger type and determine next action ────
+      - name: Detect trigger type and determine next action
+        id: detect
+        env:
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          MANUAL_COMPLETED_WAVE: ${{ github.event.inputs.completed_wave }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f backlog/wave-state.json ]; then
+            echo "❌ backlog/wave-state.json not found"
+            exit 1
+          fi
+
+          WAVE_STATE=$(cat backlog/wave-state.json)
+          TOTAL_WAVES=$(echo "$WAVE_STATE" | jq -r '.metadata.total_waves')
+          TRACKER=$(echo "$WAVE_STATE" | jq -r '.metadata.pipeline_tracker' | tr -d '#')
+
+          ACTION=""
+          NEXT_WAVE=""
+          COMPLETED_WAVE=""
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            # Manual recovery — treat as a wave completion
+            COMPLETED_WAVE="$MANUAL_COMPLETED_WAVE"
+            NEXT_WAVE=$((COMPLETED_WAVE + 1))
+            echo "🔧 Manual recovery: marking wave ${COMPLETED_WAVE} complete"
+
+            if [ "$NEXT_WAVE" -ge "$TOTAL_WAVES" ]; then
+              ACTION="build_complete"
+            else
+              ACTION="start_wave"
+            fi
+
+          elif echo "$PR_LABELS" | grep -q "sdlc:build-plan"; then
+            # Planning PR just merged — start Wave 0
+            ACTION="start_wave"
+            NEXT_WAVE=0
+
+          elif echo "$PR_LABELS" | grep -q "sdlc:wave"; then
+            # A wave PR was merged — find which wave completed
+            # Parse wave number from PR title (format: "Wave N — Theme")
+            COMPLETED_WAVE=$(echo "$PR_TITLE" | grep -oP 'Wave \K[0-9]+' || true)
+
+            if [ -z "$COMPLETED_WAVE" ]; then
+              echo "❌ Could not determine wave number from PR title: $PR_TITLE"
+              exit 1
+            fi
+
+            NEXT_WAVE=$((COMPLETED_WAVE + 1))
+
+            if [ "$NEXT_WAVE" -ge "$TOTAL_WAVES" ]; then
+              ACTION="build_complete"
+            else
+              ACTION="start_wave"
+            fi
+          fi
+
+          echo "action=${ACTION}" >> "$GITHUB_OUTPUT"
+          echo "next_wave=${NEXT_WAVE}" >> "$GITHUB_OUTPUT"
+          echo "completed_wave=${COMPLETED_WAVE}" >> "$GITHUB_OUTPUT"
+          echo "total_waves=${TOTAL_WAVES}" >> "$GITHUB_OUTPUT"
+          echo "tracker=${TRACKER}" >> "$GITHUB_OUTPUT"
+
+          echo "📋 Action: ${ACTION}"
+          echo "📋 Next wave: ${NEXT_WAVE}"
+          echo "📋 Completed wave: ${COMPLETED_WAVE:-N/A}"
+          echo "📋 Total waves: ${TOTAL_WAVES}"
+          echo "📋 Tracker: #${TRACKER}"
+
+      # ── 3. Update wave-state.json (if a wave was completed) ─
+      - name: Update wave-state.json for completed wave
+        if: steps.detect.outputs.completed_wave != ''
+        env:
+          COMPLETED_WAVE: ${{ steps.detect.outputs.completed_wave }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          WAVE_STATE=$(cat backlog/wave-state.json)
+          UPDATED=$(echo "$WAVE_STATE" | jq \
+            --arg wave "$COMPLETED_WAVE" \
+            --arg pr "$PR_NUMBER" \
+            --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '.waves[$wave].status = "completed" |
+             .waves[$wave].pr_number = ($pr | tonumber) |
+             .waves[$wave].completed_at = $now')
+          echo "$UPDATED" > backlog/wave-state.json
+
+          echo "✅ Marked wave ${COMPLETED_WAVE} as completed in wave-state.json"
+
+      # ── 4. Create next wave issue ───────────────────────────
+      - name: Create next wave issue
+        if: steps.detect.outputs.action == 'start_wave'
+        id: create-issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT_WAVE: ${{ steps.detect.outputs.next_wave }}
+          TOTAL_WAVES: ${{ steps.detect.outputs.total_waves }}
+          TRACKER: ${{ steps.detect.outputs.tracker }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          WAVE_STATE=$(cat backlog/wave-state.json)
+          WAVE_INFO=$(echo "$WAVE_STATE" | jq -r --arg w "$NEXT_WAVE" '.waves[$w]')
+          THEME=$(echo "$WAVE_INFO" | jq -r '.theme')
+          BRANCH=$(echo "$WAVE_INFO" | jq -r '.branch')
+          ALL_TASKS=$(echo "$WAVE_INFO" | jq -r '.tasks | join(", ")')
+          BACKEND_TASKS=$(echo "$WAVE_INFO" | jq -r '.backend_tasks | join(", ")')
+          FRONTEND_TASKS=$(echo "$WAVE_INFO" | jq -r '.frontend_tasks | join(", ")')
+
+          # Build previously completed waves context
+          PREV_WAVES=""
+          if [ "$NEXT_WAVE" -eq 0 ]; then
+            PREV_WAVES="None — this is the first wave."
+          else
+            for ((i=0; i<NEXT_WAVE; i++)); do
+              W_TASKS=$(echo "$WAVE_STATE" | jq -r --arg w "$i" '.waves[$w].tasks | join(", ")')
+              W_PR=$(echo "$WAVE_STATE" | jq -r --arg w "$i" '.waves[$w].pr_number // "N/A"')
+              PREV_WAVES="${PREV_WAVES}
+          - Wave ${i}: ${W_TASKS} (PR #${W_PR}, merged)"
+            done
+          fi
+
+          FRONTEND_SECTION=""
+          if [ -n "$FRONTEND_TASKS" ] && [ "$FRONTEND_TASKS" != "null" ]; then
+            FRONTEND_SECTION="- **Frontend Tasks:** ${FRONTEND_TASKS} (invoke \`@5-ui-develop-agent\` for these)"
+          else
+            FRONTEND_SECTION="- **Frontend Tasks:** None"
+          fi
+
+          LAST_WAVE_INDEX=$((TOTAL_WAVES - 1))
+
+          BODY="## 🤖 SDLC Pipeline — Wave ${NEXT_WAVE} Implementation
+
+          **Pipeline Tracker**: #${TRACKER}
+          **Wave**: ${NEXT_WAVE} of ${LAST_WAVE_INDEX} — ${THEME}
+          **Agent**: \`@4-develop-agent\` (+ \`@5-ui-develop-agent\` for frontend tasks)
+          **Triggered by**: Merge of PR #${PR_NUMBER}
+
+          ### Wave Assignment
+
+          - **Branch:** \`${BRANCH}\`
+          - **All Tasks:** ${ALL_TASKS}
+          - **Backend Tasks:** ${BACKEND_TASKS}
+          ${FRONTEND_SECTION}
+
+          ### Instructions
+
+          Follow the instructions in \`.github/agents/4-develop-agent.agent.md\` to implement this wave:
+
+          1. Create branch \`${BRANCH}\` from \`main\`
+          2. Read task files in \`backlog/tasks/\` for each assigned task ID
+          3. Implement **backend tasks** following coding standards
+          4. For **frontend tasks** (if any), invoke \`@5-ui-develop-agent\` on the same branch
+          5. Run verification gates (syntax, imports, tests)
+          6. Open a PR targeting \`main\` with label \`sdlc:wave\`
+          7. Reference this issue and the pipeline tracker (#${TRACKER}) in the PR body
+
+          ### Previously Completed Waves
+          ${PREV_WAVES}
+
+          ### Context
+
+          All code from previous waves is on \`main\`. The full wave plan is in \`backlog/execution-plan.md\` and \`backlog/wave-state.json\`."
+
+          # Strip leading whitespace from heredoc-style indentation
+          BODY=$(echo "$BODY" | sed 's/^          //')
+
+          # Create the issue
+          ISSUE_RESPONSE=$(gh api "repos/${{ github.repository }}/issues" \
+            -f title="[SDLC Agent 4] Wave ${NEXT_WAVE} — ${THEME}" \
+            -f body="$BODY" \
+            -f "labels[]=sdlc:pipeline")
+
+          ISSUE_URL=$(echo "$ISSUE_RESPONSE" | jq -r '.html_url')
+          ISSUE_NUM=$(echo "$ISSUE_RESPONSE" | jq -r '.number')
+
+          echo "✅ Created issue #${ISSUE_NUM}: ${ISSUE_URL}"
+
+          # Try to assign copilot
+          gh api "repos/${{ github.repository }}/issues/${ISSUE_NUM}/assignees" \
+            -f "assignees[]=copilot" 2>/dev/null || echo "⚠️ Could not assign copilot"
+
+          # Update wave-state.json with issue number and status
+          UPDATED=$(cat backlog/wave-state.json | jq \
+            --arg wave "$NEXT_WAVE" \
+            --arg issue "$ISSUE_NUM" \
+            '.waves[$wave].status = "in_progress" |
+             .waves[$wave].issue_number = ($issue | tonumber)')
+          echo "$UPDATED" > backlog/wave-state.json
+
+          echo "issue_url=${ISSUE_URL}" >> "$GITHUB_OUTPUT"
+          echo "issue_number=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
+
+      # ── 5. Commit wave-state.json updates to main ──────────
+      - name: Commit wave-state.json updates
+        env:
+          COMPLETED_WAVE: ${{ steps.detect.outputs.completed_wave }}
+          NEXT_WAVE: ${{ steps.detect.outputs.next_wave }}
+          ACTION: ${{ steps.detect.outputs.action }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add backlog/wave-state.json
+
+          git diff --cached --quiet || {
+            git commit -m "Update wave-state.json: Wave ${COMPLETED_WAVE:-plan} → Wave ${NEXT_WAVE:-complete}
+
+          Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+            git push origin main
+          }
+
+      # ── 6. Handle build complete ────────────────────────────
+      - name: Generate execution log and create summary PR
+        if: steps.detect.outputs.action == 'build_complete'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOTAL_WAVES: ${{ steps.detect.outputs.total_waves }}
+          TRACKER: ${{ steps.detect.outputs.tracker }}
+        run: |
+          set -euo pipefail
+
+          WAVE_STATE=$(cat backlog/wave-state.json)
+          TOTAL_TASKS=$(echo "$WAVE_STATE" | jq -r '.metadata.total_tasks')
+
+          # Generate wave results for the execution log
+          WAVE_RESULTS=""
+          for ((i=0; i<TOTAL_WAVES; i++)); do
+            W=$(echo "$WAVE_STATE" | jq -r --arg w "$i" '.waves[$w]')
+            W_THEME=$(echo "$W" | jq -r '.theme')
+            W_PR=$(echo "$W" | jq -r '.pr_number')
+            W_TASKS=$(echo "$W" | jq -r '.tasks | join(", ")')
+            W_COMPLETED=$(echo "$W" | jq -r '.completed_at')
+            WAVE_RESULTS="${WAVE_RESULTS}### Wave ${i} — ${W_THEME}
+          - **PR**: #${W_PR}
+          - **Tasks**: ${W_TASKS}
+          - **Status**: ✅ Completed
+          - **Completed at**: ${W_COMPLETED}
+
+          "
+          done
+
+          cat > backlog/execution-log.md <<LOG_EOF
+          # Execution Log
+
+          Generated by the wave orchestrator workflow.
+
+          ## Summary
+
+          - **Total waves**: ${TOTAL_WAVES}
+          - **Total tasks**: ${TOTAL_TASKS}
+          - **Status**: ✅ All waves completed
+
+          ## Wave Results
+
+          ${WAVE_RESULTS}
+          LOG_EOF
+
+          # Strip leading whitespace from indented heredoc
+          sed -i 's/^          //' backlog/execution-log.md
+
+          # Update wave-state.json — mark all complete
+          FINAL_STATE=$(cat backlog/wave-state.json | jq '.metadata.status = "completed"')
+          echo "$FINAL_STATE" > backlog/wave-state.json
+
+          # Build wave summary for PR body
+          WAVE_SUMMARY=""
+          for ((i=0; i<TOTAL_WAVES; i++)); do
+            W=$(echo "$WAVE_STATE" | jq -r --arg w "$i" '.waves[$w]')
+            W_THEME=$(echo "$W" | jq -r '.theme')
+            W_PR=$(echo "$W" | jq -r '.pr_number')
+            WAVE_SUMMARY="${WAVE_SUMMARY}
+          - **Wave ${i}** — ${W_THEME}: PR #${W_PR} ✅"
+          done
+
+          # Create summary branch and PR
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b sdlc/build
+          git add -A
+          git commit -m "Build complete: all ${TOTAL_WAVES} waves implemented
+
+          Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+          git push -u origin sdlc/build
+
+          PR_BODY="## 🏗️ Build Stage Complete
+
+          **Pipeline Tracker**: #${TRACKER}
+
+          All ${TOTAL_WAVES} execution waves have been implemented and merged.
+
+          ### Wave Summary
+          ${WAVE_SUMMARY}
+
+          ### Artifacts
+          - \`backlog/execution-plan.md\` — Wave execution plan
+          - \`backlog/wave-state.json\` — Wave state tracking
+          - \`backlog/execution-log.md\` — Execution results log
+
+          ### Next Stage
+          When this PR is merged, the **Automation Test Agent** (Agent 6) will be triggered automatically."
+
+          # Strip leading whitespace
+          PR_BODY=$(echo "$PR_BODY" | sed 's/^          //')
+
+          # Ensure label exists before creating PR
+          gh label create "sdlc:build-complete" --color "D93F0B" \
+            --description "Build orchestration complete — all waves merged" \
+            --force 2>/dev/null || true
+
+          # Use REST API to create the PR (gh pr create uses GraphQL which
+          # can fail with "Resource not accessible by integration")
+          PR_RESPONSE=$(gh api "repos/${{ github.repository }}/pulls" \
+            -f title="Build Complete — All ${TOTAL_WAVES} waves implemented" \
+            -f body="$PR_BODY" \
+            -f head="sdlc/build" \
+            -f base="main")
+
+          BUILD_PR_NUM=$(echo "$PR_RESPONSE" | jq -r '.number')
+          echo "✅ Created PR #${BUILD_PR_NUM}"
+
+          # Apply the build-complete label via REST
+          gh api "repos/${{ github.repository }}/issues/${BUILD_PR_NUM}/labels" \
+            -f "labels[]=sdlc:build-complete" --silent
+
+      # ── 7. Comment on pipeline tracker ──────────────────────
+      - name: Comment on pipeline tracker
+        if: steps.detect.outputs.tracker != '' && steps.detect.outputs.tracker != 'null'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTION: ${{ steps.detect.outputs.action }}
+          NEXT_WAVE: ${{ steps.detect.outputs.next_wave }}
+          TOTAL_WAVES: ${{ steps.detect.outputs.total_waves }}
+          TRACKER: ${{ steps.detect.outputs.tracker }}
+          ISSUE_URL: ${{ steps.create-issue.outputs.issue_url }}
+        run: |
+          set -euo pipefail
+
+          WAVE_STATE=$(cat backlog/wave-state.json)
+
+          if [ "$ACTION" = "start_wave" ]; then
+            THEME=$(echo "$WAVE_STATE" | jq -r --arg w "$NEXT_WAVE" '.waves[$w].theme')
+            gh api "repos/${{ github.repository }}/issues/${TRACKER}/comments" \
+              -f body="🔄 **Wave ${NEXT_WAVE} — ${THEME}**: Issue created → ${ISSUE_URL}"
+
+          elif [ "$ACTION" = "build_complete" ]; then
+            gh api "repos/${{ github.repository }}/issues/${TRACKER}/comments" \
+              -f body="🏗️ **Build Stage Complete**: All ${TOTAL_WAVES} waves implemented and merged. Summary PR created."
+          fi

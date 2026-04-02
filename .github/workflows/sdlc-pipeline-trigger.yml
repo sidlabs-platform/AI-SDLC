@@ -1,0 +1,227 @@
+name: SDLC — Pipeline Trigger
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  trigger-next-agent:
+    name: Trigger Next Pipeline Stage
+    if: >-
+      github.event.pull_request.merged == true &&
+      (
+        contains(github.event.pull_request.labels.*.name, 'sdlc:requirements-complete') ||
+        contains(github.event.pull_request.labels.*.name, 'sdlc:design-complete') ||
+        contains(github.event.pull_request.labels.*.name, 'sdlc:backlog-complete') ||
+        contains(github.event.pull_request.labels.*.name, 'sdlc:build-complete') ||
+        contains(github.event.pull_request.labels.*.name, 'sdlc:tests-complete') ||
+        contains(github.event.pull_request.labels.*.name, 'sdlc:security-complete')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect pipeline stage and determine next agent
+        id: detect
+        env:
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          echo "Merged PR #${PR_NUMBER}: ${PR_TITLE}"
+          echo "Labels: ${PR_LABELS}"
+
+          # Mapping: merged label → next agent details
+          if echo "$PR_LABELS" | grep -q "sdlc:requirements-complete"; then
+            echo "current_stage=1-requirements" >> "$GITHUB_OUTPUT"
+            echo "next_agent=2-plan-and-design-agent" >> "$GITHUB_OUTPUT"
+            echo "next_stage_num=2" >> "$GITHUB_OUTPUT"
+            echo "next_stage_name=Plan & Design" >> "$GITHUB_OUTPUT"
+            echo "next_branch=sdlc/design" >> "$GITHUB_OUTPUT"
+            echo "next_label=sdlc:design-complete" >> "$GITHUB_OUTPUT"
+            echo "next_artifacts=docs/design/HLD.md, docs/design/LLD/*.md, docs/change-log.md" >> "$GITHUB_OUTPUT"
+            echo "pipeline_complete=false" >> "$GITHUB_OUTPUT"
+
+          elif echo "$PR_LABELS" | grep -q "sdlc:design-complete"; then
+            echo "current_stage=2-design" >> "$GITHUB_OUTPUT"
+            echo "next_agent=3-epic-and-tasks-agent" >> "$GITHUB_OUTPUT"
+            echo "next_stage_num=3" >> "$GITHUB_OUTPUT"
+            echo "next_stage_name=Epic & Tasks Decomposition" >> "$GITHUB_OUTPUT"
+            echo "next_branch=sdlc/backlog" >> "$GITHUB_OUTPUT"
+            echo "next_label=sdlc:backlog-complete" >> "$GITHUB_OUTPUT"
+            echo "next_artifacts=backlog/epics/, backlog/stories/, backlog/tasks/, backlog/dependency-graph.json, docs/change-log.md" >> "$GITHUB_OUTPUT"
+            echo "pipeline_complete=false" >> "$GITHUB_OUTPUT"
+
+          elif echo "$PR_LABELS" | grep -q "sdlc:backlog-complete"; then
+            # Stage 3.5 (Build Planning) is automated by sdlc-build-planner.yml
+            # No agent issue needed — the workflow triggers automatically.
+            echo "current_stage=3-backlog" >> "$GITHUB_OUTPUT"
+            echo "pipeline_complete=false" >> "$GITHUB_OUTPUT"
+            echo "skip_issue=true" >> "$GITHUB_OUTPUT"
+            echo "📋 Build planning is automated — sdlc-build-planner.yml handles this stage"
+
+          elif echo "$PR_LABELS" | grep -q "sdlc:build-complete"; then
+            echo "current_stage=3.5-build" >> "$GITHUB_OUTPUT"
+            echo "next_agent=6-automation-test-agent" >> "$GITHUB_OUTPUT"
+            echo "next_stage_num=6" >> "$GITHUB_OUTPUT"
+            echo "next_stage_name=Automation Testing" >> "$GITHUB_OUTPUT"
+            echo "next_branch=sdlc/tests" >> "$GITHUB_OUTPUT"
+            echo "next_label=sdlc:tests-complete" >> "$GITHUB_OUTPUT"
+            echo "next_artifacts=tests/, docs/testing/TestPlan.md, docs/change-log.md" >> "$GITHUB_OUTPUT"
+            echo "pipeline_complete=false" >> "$GITHUB_OUTPUT"
+
+          elif echo "$PR_LABELS" | grep -q "sdlc:tests-complete"; then
+            echo "current_stage=6-tests" >> "$GITHUB_OUTPUT"
+            echo "next_agent=7-security-agent" >> "$GITHUB_OUTPUT"
+            echo "next_stage_num=7" >> "$GITHUB_OUTPUT"
+            echo "next_stage_name=Security Review" >> "$GITHUB_OUTPUT"
+            echo "next_branch=sdlc/security" >> "$GITHUB_OUTPUT"
+            echo "next_label=sdlc:security-complete" >> "$GITHUB_OUTPUT"
+            echo "next_artifacts=docs/testing/security-review.md, docs/change-log.md" >> "$GITHUB_OUTPUT"
+            echo "pipeline_complete=false" >> "$GITHUB_OUTPUT"
+
+          elif echo "$PR_LABELS" | grep -q "sdlc:security-complete"; then
+            echo "current_stage=7-security" >> "$GITHUB_OUTPUT"
+            echo "pipeline_complete=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find pipeline tracking issue
+        id: tracker
+        if: steps.detect.outputs.pipeline_complete != 'true' || steps.detect.outputs.pipeline_complete == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # Try to extract tracker issue number from the merged PR body
+          TRACKER_NUM=$(echo "$PR_BODY" | grep -oP 'Pipeline Tracker.*?#\K[0-9]+' | head -1 || true)
+
+          if [ -z "$TRACKER_NUM" ]; then
+            # Fallback: search for the most recent open pipeline tracking issue
+            TRACKER_NUM=$(gh issue list \
+              --label "sdlc:pipeline" \
+              --state open \
+              --search "[SDLC Pipeline]" \
+              --json number \
+              --jq '.[0].number // empty' || true)
+          fi
+
+          echo "tracker_num=${TRACKER_NUM}" >> "$GITHUB_OUTPUT"
+          if [ -n "$TRACKER_NUM" ]; then
+            echo "📋 Found pipeline tracker: #${TRACKER_NUM}"
+          else
+            echo "⚠️ No pipeline tracker found — continuing without traceability updates"
+          fi
+
+      - name: Create next agent issue
+        if: steps.detect.outputs.pipeline_complete == 'false' && steps.detect.outputs.skip_issue != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEXT_AGENT: ${{ steps.detect.outputs.next_agent }}
+          NEXT_STAGE_NUM: ${{ steps.detect.outputs.next_stage_num }}
+          NEXT_STAGE_NAME: ${{ steps.detect.outputs.next_stage_name }}
+          NEXT_BRANCH: ${{ steps.detect.outputs.next_branch }}
+          NEXT_LABEL: ${{ steps.detect.outputs.next_label }}
+          NEXT_ARTIFACTS: ${{ steps.detect.outputs.next_artifacts }}
+          MERGED_PR: ${{ github.event.pull_request.number }}
+          MERGED_PR_TITLE: ${{ github.event.pull_request.title }}
+          TRACKER_NUM: ${{ steps.tracker.outputs.tracker_num }}
+        run: |
+          TRACKER_REF=""
+          if [ -n "$TRACKER_NUM" ]; then
+            TRACKER_REF="**Pipeline Tracker**: #${TRACKER_NUM}"
+          else
+            TRACKER_REF="**Pipeline Tracker**: _(not found)_"
+          fi
+
+          BODY=$(cat <<EOF
+          ## 🤖 SDLC Pipeline — Run ${NEXT_STAGE_NAME} Agent
+
+          ${TRACKER_REF}
+          **Stage**: ${NEXT_STAGE_NUM} — ${NEXT_STAGE_NAME}
+          **Agent**: \`@${NEXT_AGENT}\`
+          **Triggered by**: Merge of PR #${MERGED_PR} (${MERGED_PR_TITLE})
+
+          ### Instructions
+
+          Follow the instructions in \`.github/agents/${NEXT_AGENT}.agent.md\` to complete this stage.
+
+          ### Context from Previous Stage
+
+          The previous stage's PR (#${MERGED_PR}) has been merged into \`main\`. All artifacts from prior stages are available in the repository.
+
+          ### Required Outputs
+
+          1. Create branch \`${NEXT_BRANCH}\` from \`main\`
+          2. Produce the required artifacts: ${NEXT_ARTIFACTS}
+          3. Open a PR targeting \`main\` with label \`${NEXT_LABEL}\`
+          4. Reference this issue and the pipeline tracker (#${TRACKER_NUM}) in the PR body
+
+          ### Traceability
+
+          - ${TRACKER_REF}
+          - **Previous Stage PR**: #${MERGED_PR}
+          - **Next Stage**: Auto-triggered when this stage's PR is merged
+          EOF
+          )
+
+          ISSUE_RESPONSE=$(gh api repos/${{ github.repository }}/issues \
+            -f title="[SDLC Agent ${NEXT_STAGE_NUM}] ${NEXT_STAGE_NAME}" \
+            -f body="$BODY" \
+            -f "labels[]=sdlc:pipeline")
+
+          ISSUE_URL=$(echo "$ISSUE_RESPONSE" | jq -r '.html_url')
+          ISSUE_NUM=$(echo "$ISSUE_RESPONSE" | jq -r '.number')
+          echo "🚀 Next agent issue created: $ISSUE_URL"
+
+          # Try to assign copilot (may fail if not available)
+          gh api repos/${{ github.repository }}/issues/${ISSUE_NUM}/assignees \
+            -f "assignees[]=copilot" 2>/dev/null || echo "⚠️ Could not assign copilot — assign manually"
+
+          # Update tracker issue with transition log
+          if [ -n "$TRACKER_NUM" ]; then
+            gh api repos/${{ github.repository }}/issues/${TRACKER_NUM}/comments \
+              -f body="🔄 **Stage ${NEXT_STAGE_NUM} — ${NEXT_STAGE_NAME}**: PR #${MERGED_PR} merged ✅ → Agent issue created → $ISSUE_URL"
+          fi
+
+      - name: Pipeline complete
+        if: steps.detect.outputs.pipeline_complete == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGED_PR: ${{ github.event.pull_request.number }}
+          TRACKER_NUM: ${{ steps.tracker.outputs.tracker_num }}
+        run: |
+          echo "🎉 SDLC Pipeline Complete!"
+
+          if [ -n "$TRACKER_NUM" ]; then
+            COMPLETE_BODY=$(cat <<EOF
+          ## 🎉 Pipeline Complete!
+
+          All 7 stages have been completed successfully.
+
+          **Final stage PR**: #${MERGED_PR} (Security Review)
+
+          ### Summary
+          The full SDLC pipeline has run:
+          1. ✅ Requirements → BRD produced
+          2. ✅ Design → HLD + LLD produced
+          3. ✅ Backlog → EPICs, Stories, Tasks decomposed
+          3.5. ✅ Build → Source code implemented
+          6. ✅ Tests → Test suite created
+          7. ✅ Security → Security review completed
+
+          This pipeline tracking issue will now be closed.
+          EOF
+          )
+
+            gh api repos/${{ github.repository }}/issues/${TRACKER_NUM}/comments \
+              -f body="$COMPLETE_BODY"
+
+            gh api repos/${{ github.repository }}/issues/${TRACKER_NUM} \
+              -X PATCH -f state=closed -f state_reason=completed
+          fi

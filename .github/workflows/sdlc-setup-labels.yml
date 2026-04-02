@@ -1,0 +1,35 @@
+name: SDLC — Setup Pipeline Labels
+
+on:
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  create-labels:
+    name: Create SDLC Labels
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create pipeline labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          create_label() {
+            gh label create "$1" --repo "$REPO" --color "$2" --description "$3" --force
+          }
+
+          echo "Creating SDLC pipeline labels..."
+
+          create_label "sdlc:pipeline"              "0E8A16" "SDLC pipeline tracking label"
+          create_label "sdlc:requirements-complete"  "1D76DB" "Agent 1 — Requirements phase complete"
+          create_label "sdlc:design-complete"        "5319E7" "Agent 2 — Design phase complete"
+          create_label "sdlc:backlog-complete"        "FBCA04" "Agent 3 — Backlog decomposition complete"
+          create_label "sdlc:build-plan"             "C5DEF5" "Agent 3.5 — Build plan created (waves computed)"
+          create_label "sdlc:build-complete"          "D93F0B" "Build orchestration complete — all waves merged"
+          create_label "sdlc:wave"                    "0E8A16" "Build wave PR (auto-triggers next wave on merge)"
+          create_label "sdlc:tests-complete"          "0075CA" "Agent 6 — Test suite complete"
+          create_label "sdlc:security-complete"       "B60205" "Agent 7 — Security review complete"
+
+          echo "✅ All SDLC labels created successfully"

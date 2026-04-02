@@ -1,0 +1,124 @@
+name: SDLC — Kickoff Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      description:
+        description: "Pipeline context — what is being built (passed to the first agent)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  kickoff:
+    name: Start SDLC Pipeline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create pipeline tracking issue
+        id: tracker
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DESCRIPTION="${{ inputs.description }}"
+          [ -z "$DESCRIPTION" ] && DESCRIPTION="No description provided"
+          RUN_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          BODY=$(cat <<EOF
+          # 🚀 SDLC Pipeline Tracker
+
+          **Status**: 🟢 In Progress
+          **Started**: ${RUN_DATE}
+          **Description**: ${DESCRIPTION}
+          **Triggered by**: @${{ github.actor }}
+
+          ## Pipeline Progress
+
+          | # | Stage | Agent | Status | PR | Agent Issue |
+          |---|-------|-------|--------|----|-------------|
+          | 1 | Requirements | \`@1-requirement-agent\` | ⏳ Pending | — | See below |
+          | 2 | Design | \`@2-plan-and-design-agent\` | ⬜ Waiting | — | — |
+          | 3 | Backlog | \`@3-epic-and-tasks-agent\` | ⬜ Waiting | — | — |
+          | 3.5 | Build | \`@3.5-build-orchestrator-agent\` | ⬜ Waiting | — | — |
+          | 6 | Tests | \`@6-automation-test-agent\` | ⬜ Waiting | — | — |
+          | 7 | Security | \`@7-security-agent\` | ⬜ Waiting | — | — |
+
+          ## Traceability Log
+
+          _Stage transitions are logged here automatically as the pipeline progresses._
+
+          ---
+          _This issue is updated by the \`sdlc-pipeline-trigger\` workflow on each stage transition._
+          EOF
+          )
+
+          TRACKER_RESPONSE=$(gh api repos/${{ github.repository }}/issues \
+            -f title="[SDLC Pipeline] Run — $(date -u +%Y-%m-%d)" \
+            -f body="$BODY" \
+            -f "labels[]=sdlc:pipeline")
+
+          TRACKER_NUM=$(echo "$TRACKER_RESPONSE" | jq -r '.number')
+          TRACKER_URL=$(echo "$TRACKER_RESPONSE" | jq -r '.html_url')
+          echo "tracker_url=$TRACKER_URL" >> "$GITHUB_OUTPUT"
+          echo "tracker_num=$TRACKER_NUM" >> "$GITHUB_OUTPUT"
+          echo "📋 Pipeline tracking issue created: $TRACKER_URL"
+
+      - name: Create agent 1 issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRACKER_NUM: ${{ steps.tracker.outputs.tracker_num }}
+          TRACKER_URL: ${{ steps.tracker.outputs.tracker_url }}
+        run: |
+          DESCRIPTION="${{ inputs.description }}"
+          [ -z "$DESCRIPTION" ] && DESCRIPTION="No additional context provided"
+
+          BODY=$(cat <<EOF
+          ## 🤖 SDLC Pipeline — Run Requirement Agent
+
+          **Pipeline Tracker**: #${TRACKER_NUM}
+          **Stage**: 1 of 7 — Requirements Gathering
+          **Agent**: \`@1-requirement-agent\`
+
+          ### Instructions
+
+          Follow the instructions in \`.github/agents/1-requirement-agent.agent.md\` to produce the Business Requirements Document.
+
+          ### Context
+
+          ${DESCRIPTION}
+
+          ### Required Outputs
+
+          1. Create branch \`sdlc/requirements\` from \`main\`
+          2. Produce: \`docs/requirements/BRD.md\`, \`docs/change-log.md\`
+          3. Open a PR targeting \`main\` with label \`sdlc:requirements-complete\`
+          4. Reference this issue and the pipeline tracker (#${TRACKER_NUM}) in the PR body
+
+          ### Traceability
+
+          - **Pipeline Tracker**: ${TRACKER_URL}
+          - **Previous Stage**: N/A (first stage)
+          - **Next Stage**: Agent 2 — Plan & Design (auto-triggered on PR merge)
+          EOF
+          )
+
+          ISSUE_RESPONSE=$(gh api repos/${{ github.repository }}/issues \
+            -f title="[SDLC Agent 1] Gather Requirements" \
+            -f body="$BODY" \
+            -f "labels[]=sdlc:pipeline")
+
+          ISSUE_URL=$(echo "$ISSUE_RESPONSE" | jq -r '.html_url')
+          ISSUE_NUM=$(echo "$ISSUE_RESPONSE" | jq -r '.number')
+          echo "🚀 Agent 1 issue created: $ISSUE_URL"
+
+          # Try to assign copilot (may fail if not available)
+          gh api repos/${{ github.repository }}/issues/${ISSUE_NUM}/assignees \
+            -f "assignees[]=copilot" 2>/dev/null || echo "⚠️ Could not assign copilot — assign manually"
+
+          # Log the transition on the tracker issue
+          gh api repos/${{ github.repository }}/issues/${TRACKER_NUM}/comments \
+            -f body="🔄 **Stage 1 — Requirements**: Agent issue created → $ISSUE_URL"

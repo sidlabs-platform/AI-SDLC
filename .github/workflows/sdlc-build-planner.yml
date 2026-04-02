@@ -1,0 +1,201 @@
+# ──────────────────────────────────────────────────────────────
+# SDLC — Build Planner (replaces Agent 3.5)
+#
+# Automatically computes execution waves from the dependency
+# graph when the backlog stage PR is merged. Creates a build-plan
+# PR with the wave artifacts. No Copilot agent session needed.
+# ──────────────────────────────────────────────────────────────
+name: "SDLC — Build Planner"
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  compute-waves:
+    name: Compute Execution Waves
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.labels.*.name, 'sdlc:backlog-complete')
+
+    steps:
+      # ── 1. Checkout main ────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      # ── 2. Set up Python ────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── 3. Extract pipeline tracker from merged PR ──────────
+      - name: Extract pipeline context
+        id: context
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Try to extract tracker issue number from the merged PR body
+          TRACKER_NUM=$(echo "$PR_BODY" | grep -oP 'Pipeline Tracker.*?#\K[0-9]+' | head -1 || true)
+
+          if [ -z "$TRACKER_NUM" ]; then
+            # Fallback: search for the most recent open pipeline tracking issue
+            TRACKER_NUM=$(gh issue list \
+              --label "sdlc:pipeline" \
+              --state open \
+              --search "[SDLC Pipeline]" \
+              --json number \
+              --jq '.[0].number // empty' 2>/dev/null || true)
+          fi
+
+          echo "tracker_num=${TRACKER_NUM}" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$TRACKER_NUM" ]; then
+            echo "📋 Pipeline tracker: #${TRACKER_NUM}"
+          else
+            echo "⚠️ No pipeline tracker found"
+          fi
+
+      # ── 4. Run wave computation script ──────────────────────
+      - name: Compute execution waves
+        id: compute
+        env:
+          TRACKER_NUM: ${{ steps.context.outputs.tracker_num }}
+          PR_NUMBER: ${{ steps.context.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          python scripts/compute-waves.py \
+            --tracker-issue "${TRACKER_NUM:-}" \
+            --triggering-pr "${PR_NUMBER:-}"
+
+          # Read wave count for PR title
+          TOTAL_WAVES=$(python -c "import json; print(json.load(open('backlog/wave-state.json'))['metadata']['total_waves'])")
+          echo "total_waves=${TOTAL_WAVES}" >> "$GITHUB_OUTPUT"
+
+      # ── 5. Create branch and commit artifacts ───────────────
+      - name: Create build-plan branch and commit
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Delete remote branch if it exists from a previous failed run
+          git push origin --delete sdlc/build-plan 2>/dev/null || true
+
+          git checkout -b sdlc/build-plan
+          git add -A
+          git commit -m "Build plan: ${{ steps.compute.outputs.total_waves }} waves computed from dependency graph
+
+          Artifacts: execution-plan.md, wave-state.json, task wave assignments
+
+          Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+          git push -u origin sdlc/build-plan
+
+      # ── 6. Open build-plan PR ───────────────────────────────
+      - name: Open build-plan PR
+        id: create-pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRACKER_NUM: ${{ steps.context.outputs.tracker_num }}
+          TRIGGERING_PR: ${{ steps.context.outputs.pr_number }}
+          TOTAL_WAVES: ${{ steps.compute.outputs.total_waves }}
+        run: |
+          set -euo pipefail
+
+          WAVE_STATE=$(cat backlog/wave-state.json)
+
+          # Build wave summary table
+          WAVE_TABLE="| Wave | Theme | Tasks | Backend | Frontend | Branch |
+          |------|-------|-------|---------|----------|--------|"
+
+          for i in $(seq 0 $((TOTAL_WAVES - 1))); do
+            THEME=$(echo "$WAVE_STATE" | jq -r --arg w "$i" '.waves[$w].theme')
+            TOTAL=$(echo "$WAVE_STATE" | jq -r --arg w "$i" '.waves[$w].tasks | length')
+            BE=$(echo "$WAVE_STATE" | jq -r --arg w "$i" '.waves[$w].backend_tasks | length')
+            FE=$(echo "$WAVE_STATE" | jq -r --arg w "$i" '.waves[$w].frontend_tasks | length')
+            BRANCH=$(echo "$WAVE_STATE" | jq -r --arg w "$i" '.waves[$w].branch')
+            WAVE_TABLE="${WAVE_TABLE}
+          | ${i} | ${THEME} | ${TOTAL} | ${BE} | ${FE} | \`${BRANCH}\` |"
+          done
+
+          TRACKER_REF=""
+          if [ -n "$TRACKER_NUM" ]; then
+            TRACKER_REF="**Pipeline Tracker**: #${TRACKER_NUM}"
+          fi
+
+          PR_BODY="## Build Plan — ${TOTAL_WAVES} Execution Waves
+
+          ${TRACKER_REF}
+          **Triggering PR**: #${TRIGGERING_PR}
+          **Generated by**: \`sdlc-build-planner\` workflow (automated)
+
+          ### Wave Summary
+
+          ${WAVE_TABLE}
+
+          ### Artifacts
+
+          - [\`backlog/execution-plan.md\`](backlog/execution-plan.md) — Human-readable execution plan
+          - [\`backlog/wave-state.json\`](backlog/wave-state.json) — Machine-readable wave state
+          - All task files updated with wave assignments
+
+          ### What happens next
+
+          When this PR is merged, the **wave orchestrator workflow** will automatically create the Wave 0 issue and assign it to Copilot for implementation."
+
+          # Strip leading whitespace from heredoc-style indentation
+          PR_BODY=$(echo "$PR_BODY" | sed 's/^          //')
+
+          # Ensure label exists before creating PR
+          gh label create "sdlc:build-plan" --color "C5DEF5" \
+            --description "Agent 3.5 — Build plan created (waves computed)" \
+            --force 2>/dev/null || true
+
+          # Use REST API to create the PR (gh pr create uses GraphQL which
+          # can fail with "Resource not accessible by integration")
+          PR_RESPONSE=$(gh api "repos/${{ github.repository }}/pulls" \
+            -f title="Build Plan — ${TOTAL_WAVES} execution waves" \
+            -f body="$PR_BODY" \
+            -f head="sdlc/build-plan" \
+            -f base="main")
+
+          PR_NUM=$(echo "$PR_RESPONSE" | jq -r '.number')
+          PR_URL=$(echo "$PR_RESPONSE" | jq -r '.html_url')
+
+          # Apply the build-plan label via REST
+          gh api "repos/${{ github.repository }}/issues/${PR_NUM}/labels" \
+            -f "labels[]=sdlc:build-plan" --silent
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUM}" >> "$GITHUB_OUTPUT"
+
+          echo "✅ Build-plan PR created: ${PR_URL}"
+
+      # ── 7. Comment on pipeline tracker ──────────────────────
+      - name: Comment on pipeline tracker
+        if: steps.context.outputs.tracker_num != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRACKER_NUM: ${{ steps.context.outputs.tracker_num }}
+          TOTAL_WAVES: ${{ steps.compute.outputs.total_waves }}
+          PR_URL: ${{ steps.create-pr.outputs.pr_url }}
+          TRIGGERING_PR: ${{ steps.context.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          gh api "repos/${{ github.repository }}/issues/${TRACKER_NUM}/comments" \
+            -f body="🔄 **Stage 3.5 — Build Planning**: PR #${TRIGGERING_PR} merged ✅ → Build plan computed (${TOTAL_WAVES} waves) → ${PR_URL}"
